@@ -158,6 +158,18 @@ class TrackingCommand(CommandTerm):
             self.cfg.body_names.index(name) for name in self.cfg.reward_point_body
         ]
 
+        self.endpoint_body_indices = [
+            self.robot.body_names.index(name) for name in self.cfg.endpoint_body
+        ]
+        self.endpoint_body_offsets = (
+            torch.tensor(self.cfg.endpoint_body_offset, dtype=torch.float32, device=self.device)
+            .view(1, -1, 3)
+            .repeat(self.num_envs, 1, 1)
+        )
+        self.endpoint_body_indices_motion = [
+            self.cfg.body_names.index(name) for name in self.cfg.endpoint_body
+        ]
+
         self.down_dir = (
             torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=self.device)
             .view(1, -1)
@@ -2224,10 +2236,22 @@ class TrackingCommand(CommandTerm):
         )[:, self.reward_point_body_indices_motion]
 
     @property
+    def endpoint_body_quat_w(self) -> torch.Tensor:
+        return self.motion_lib.get_body_quat_w(
+            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        )[:, self.endpoint_body_indices_motion]
+
+    @property
     def vr_3point_body_quat_w_multi_future(self) -> torch.Tensor:
         return self.motion_lib.get_body_quat_w(self.future_motion_ids, self.future_time_steps)[
             :, self.vr_3point_body_indices_motion
         ].view(self.num_envs, self.num_future_frames, len(self.cfg.vr_3point_body), -1)
+
+    @property
+    def endpoint_body_quat_w_multi_future(self) -> torch.Tensor:
+        return self.motion_lib.get_body_quat_w(self.future_motion_ids, self.future_time_steps)[
+            :, self.endpoint_body_indices_motion
+        ].view(self.num_envs, self.num_future_frames, len(self.cfg.endpoint_body), -1)
 
     @property
     def head_orn_w_multi_future(self) -> torch.Tensor:
@@ -2243,6 +2267,17 @@ class TrackingCommand(CommandTerm):
         return (
             reward_point_original
             + quat_apply(self.reward_point_body_quat_w, self.reward_point_body_offsets)
+            + self._env.scene.env_origins[:, None, :]
+        )
+
+    @property
+    def endpoint_body_pos_w(self) -> torch.Tensor:
+        endpoint_original = self.motion_lib.get_body_pos_w(
+            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        )[:, self.endpoint_body_indices_motion]
+        return (
+            endpoint_original
+            + quat_apply(self.endpoint_body_quat_w, self.endpoint_body_offsets)
             + self._env.scene.env_origins[:, None, :]
         )
 
@@ -2286,6 +2321,22 @@ class TrackingCommand(CommandTerm):
             + self._env.scene.env_origins[:, None, None, :]
         )
         return vr_3point_pos_w
+
+    @property
+    def endpoint_body_pos_w_multi_future(self) -> torch.Tensor:
+        endpoint_original = self.motion_lib.get_body_pos_w(
+            self.future_motion_ids, self.future_time_steps
+        )[:, self.endpoint_body_indices_motion].view(
+            self.num_envs, self.num_future_frames, len(self.cfg.endpoint_body), -1
+        )
+        endpoint_offset_extend = self.endpoint_body_offsets.unsqueeze(1).repeat(
+            1, self.num_future_frames, 1, 1
+        )
+        return (
+            endpoint_original
+            + quat_apply(self.endpoint_body_quat_w_multi_future, endpoint_offset_extend)
+            + self._env.scene.env_origins[:, None, None, :]
+        )
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
@@ -2369,6 +2420,17 @@ class TrackingCommand(CommandTerm):
         return self.robot.data.body_pos_w[:, self.reward_point_body_indices] + quat_apply(
             self.robot.data.body_quat_w[:, self.reward_point_body_indices],
             self.reward_point_body_offsets,
+        )
+
+    @property
+    def robot_endpoint_body_quat_w(self) -> torch.Tensor:
+        return self.robot.data.body_quat_w[:, self.endpoint_body_indices]
+
+    @property
+    def robot_endpoint_body_pos_w(self) -> torch.Tensor:
+        return self.robot.data.body_pos_w[:, self.endpoint_body_indices] + quat_apply(
+            self.robot.data.body_quat_w[:, self.endpoint_body_indices],
+            self.endpoint_body_offsets,
         )
 
     @property
@@ -4074,6 +4136,19 @@ class TrackingCommandCfg(CommandTermCfg):
 
     reward_point_body: list[str] = []  # noqa: RUF012
     reward_point_body_offset: list[list[float]] = []  # noqa: RUF012
+
+    endpoint_body: list[str] = [  # noqa: RUF012
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+        "left_ankle_roll_link",
+        "right_ankle_roll_link",
+    ]
+    endpoint_body_offset: list[list[float]] = [  # noqa: RUF012
+        [0.18, -0.025, 0.0],
+        [0.18, 0.025, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
 
     # For backward compatibility (to remove)
     force_push_body: list[str] = []  # noqa: RUF012

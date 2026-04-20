@@ -50,6 +50,8 @@ class RewardsCfg:
     tracking_head_local_ori = None
     anti_shake_ang_vel = None
     tracking_vr_5point_local = None
+    tracking_endpoint_local_pos = None
+    tracking_endpoint_local_ori = None
     motion_5point_local_pos = None
     feet_acc = None
     is_terminated = None
@@ -363,6 +365,47 @@ def tracking_local_vr_5point_error(env: ManagerBasedRLEnv, command_name: str, st
     diff = robot_5point_pos - ref_5point_pos
     error = torch.sum(torch.square(diff), dim=-1)
     return torch.exp(-error.mean(-1) / std**2)
+
+
+def tracking_endpoint_local_pos_error(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track endpoint positions in each root's local frame."""
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    num_endpoints = len(command.cfg.endpoint_body)
+
+    ref_root_quat = command.anchor_quat_w.view(env.num_envs, 1, 4).repeat(1, num_endpoints, 1)
+    robot_root_quat = command.robot_anchor_quat_w.view(env.num_envs, 1, 4).repeat(
+        1, num_endpoints, 1
+    )
+
+    ref_local = quat_apply(
+        quat_inv(ref_root_quat), command.endpoint_body_pos_w - command.anchor_pos_w[:, None, :]
+    )
+    robot_local = quat_apply(
+        quat_inv(robot_root_quat),
+        command.robot_endpoint_body_pos_w - command.robot_anchor_pos_w[:, None, :],
+    )
+    error = torch.sum(torch.square(robot_local - ref_local), dim=-1)
+    return torch.exp(-error.mean(dim=-1) / (std * std))
+
+
+def tracking_endpoint_local_ori_error(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track endpoint orientations in each root's local frame."""
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    num_endpoints = len(command.cfg.endpoint_body)
+
+    ref_root_quat = command.anchor_quat_w.view(env.num_envs, 1, 4).repeat(1, num_endpoints, 1)
+    robot_root_quat = command.robot_anchor_quat_w.view(env.num_envs, 1, 4).repeat(
+        1, num_endpoints, 1
+    )
+
+    ref_local = quat_mul(quat_inv(ref_root_quat), command.endpoint_body_quat_w)
+    robot_local = quat_mul(quat_inv(robot_root_quat), command.robot_endpoint_body_quat_w)
+    error = quat_error_magnitude(ref_local, robot_local).square()
+    return torch.exp(-error.mean(dim=-1) / (std * std))
 
 
 def tracking_vr_3point_error_pos_force(

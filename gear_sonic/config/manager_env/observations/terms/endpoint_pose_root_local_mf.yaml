@@ -1,0 +1,5 @@
+endpoint_pose_root_local_mf:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:endpoint_pose_root_local_mf
+  params:
+    command_name: "motion"

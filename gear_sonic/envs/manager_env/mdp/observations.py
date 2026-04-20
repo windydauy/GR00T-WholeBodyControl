@@ -103,6 +103,7 @@ class PolicyCfg(ObsGroup):
     motion_anchor_ori_w = None
     motion_anchor_yaw_b = None
     robot_anchor_ori_w = None
+    robot_anchor_pose_w = None
     base_lin_vel = None
     base_ang_vel = None
     joint_pos = None
@@ -407,6 +408,8 @@ class TokenizerCfg(ObsGroup):
     joint_pos_multi_future_wrist = None
     joint_pos_multi_future_wrist_flatten = None
     joint_pos_multi_future_wrist_for_smpl = None
+    motion_anchor_pose_w_mf = None
+    endpoint_pose_root_local_mf = None
     # SOMA skeleton observations
     soma_joints_multi_future_local_nonflat = None
     soma_root_ori_b_multi_future = None
@@ -762,6 +765,14 @@ def robot_anchor_ori_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     return mat[..., :2].reshape(mat.shape[0], -1)
 
 
+def robot_anchor_pose_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Get robot anchor pose in world frame as xyz + 6D rotation."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    pos = command.robot_anchor_pos_w
+    rot = matrix_from_quat(command.robot_anchor_quat_w)[..., :2].reshape(pos.shape[0], -1)
+    return torch.cat([pos, rot], dim=-1)
+
+
 def motion_anchor_gravity_dir(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     """Compute gravity direction in the reference motion anchor frame.
 
@@ -1061,6 +1072,26 @@ def motion_anchor_ori_w_mf(
         return command.root_rot_w_multi_future.reshape(env.num_envs, command.num_future_frames, -1)
     else:
         return command.root_rot_w_multi_future.reshape(env.num_envs, -1)
+
+
+def motion_anchor_pose_w_mf(
+    env: ManagerBasedEnv, command_name: str, non_flatten: bool = False
+) -> torch.Tensor:
+    """Get future reference root pose in world frame as xyz + 6D rotation."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+
+    anchor_pos = command.anchor_pos_w_multi_future
+    if anchor_pos.ndim == 2:
+        anchor_pos = anchor_pos.view(env.num_envs, command.num_future_frames, 3)
+
+    root_rot = command.root_rot_w_multi_future
+    if root_rot.ndim == 2:
+        root_rot = root_rot.view(env.num_envs, command.num_future_frames, 6)
+
+    pose = torch.cat([anchor_pos, root_rot], dim=-1)
+    if non_flatten:
+        return pose
+    return pose.reshape(env.num_envs, -1)
 
 
 # =============================================================================
@@ -1440,6 +1471,39 @@ def vr_3point_local_orn_target(env: ManagerBasedEnv, command_name: str) -> torch
     ref_3point_quat = command.vr_3point_body_quat_w
     ref_3point_root = quat_mul(quat_inv(ref_root_quat), ref_3point_quat)
     return ref_3point_root.view(env.num_envs, -1)
+
+
+def endpoint_pose_root_local_mf(
+    env: ManagerBasedEnv, command_name: str, non_flatten: bool = False
+) -> torch.Tensor:
+    """Get future endpoint poses in the reference root frame as xyz + 6D rotation."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+
+    anchor_pos = command.anchor_pos_w_multi_future
+    if anchor_pos.ndim == 2:
+        anchor_pos = anchor_pos.view(env.num_envs, command.num_future_frames, 3)
+
+    anchor_quat = command.anchor_quat_w_multi_future
+    if anchor_quat.ndim == 2:
+        anchor_quat = anchor_quat.view(env.num_envs, command.num_future_frames, 4)
+
+    endpoint_pos = command.endpoint_body_pos_w_multi_future
+    endpoint_quat = command.endpoint_body_quat_w_multi_future
+    num_endpoints = len(command.cfg.endpoint_body)
+
+    anchor_pos_expand = anchor_pos.unsqueeze(2).expand(-1, -1, num_endpoints, -1)
+    anchor_quat_expand = anchor_quat.unsqueeze(2).expand(-1, -1, num_endpoints, -1)
+    endpoint_pos_local = quat_apply(
+        quat_inv(anchor_quat_expand), endpoint_pos - anchor_pos_expand
+    )
+    endpoint_quat_local = quat_mul(quat_inv(anchor_quat_expand), endpoint_quat)
+    endpoint_rot_local = matrix_from_quat(endpoint_quat_local)[..., :2].reshape(
+        env.num_envs, command.num_future_frames, num_endpoints, 6
+    )
+    endpoint_pose = torch.cat([endpoint_pos_local, endpoint_rot_local], dim=-1)
+    if non_flatten:
+        return endpoint_pose
+    return endpoint_pose.reshape(env.num_envs, -1)
 
 
 def vr_wrists_local_pos_target(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

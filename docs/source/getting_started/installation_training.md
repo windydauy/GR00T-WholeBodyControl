@@ -63,17 +63,18 @@ python gear_sonic/data_process/convert_soma_csv_to_motion_lib.py \
     --output data/motion_lib_bones_seed/robot \
     --fps 30 --fps_source 120 --individual --num_workers 16
 ```
-
 ### Step 2: Filter motions
 
 Remove motions the G1 robot cannot perform:
 
 ```bash
 python gear_sonic/data_process/filter_and_copy_bones_data.py \
+    --source data/optitrack_ours/robot \
+    --dest data/optitrack_ours/robot_filtered --workers 16
+```
+python gear_sonic/data_process/filter_and_copy_bones_data.py \
     --source data/motion_lib_bones_seed/robot \
     --dest data/motion_lib_bones_seed/robot_filtered --workers 16
-```
-
 This removes ~8.7% of motions (~130K of 142K remain). See the
 [Training Guide](../user_guide/training.md) for details.
 

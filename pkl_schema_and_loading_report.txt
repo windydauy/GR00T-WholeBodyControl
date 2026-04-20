@@ -1,0 +1,123 @@
+GR00T-WholeBodyControl PKL字段与读取逻辑分析报告
+
+一、分析范围
+1) 数据目录：
+   /root/yzh/GR00T-WholeBodyControl/data/motion_lib_bones_seed/robot_filtered/210531
+2) 代码目录：
+   /root/yzh/GR00T-WholeBodyControl
+3) 目标：
+   - 统计210531目录下每个PKL的键与维度设计
+   - 梳理代码中的PKL读取与处理逻辑
+
+
+二、210531目录下PKL结构统计（全量210个文件）
+1) 文件总数：210
+2) 读取异常：0
+3) 每个文件的顶层结构：
+   - 顶层是dict，且只有1个键
+   - 顶层键名是动作名（通常与文件名stem一致）
+   - 结构示意：
+     {
+       "<motion_name>": { ...motion_fields... }
+     }
+
+4) 内层字段（motion_fields）一致性：
+   - 210/210 文件内层字段完全一致
+   - 内层字段集合：
+     [dof, fps, pose_aa, root_rot, root_trans_offset, smpl_joints]
+
+5) 字段维度与类型设计（T为时间帧数）：
+   - dof:               shape=(T, 29),    dtype=float32
+   - pose_aa:           shape=(T, 30, 3), dtype=float32
+   - root_rot:          shape=(T, 4),     dtype=float32
+   - root_trans_offset: shape=(T, 3),     dtype=float32
+   - smpl_joints:       shape=(T, 24, 3), dtype=float32
+   - fps:               int（本目录内均为30）
+
+6) 时间维T统计（210531目录）：
+   - T最小值：263
+   - T最大值：2280
+   - T均值：861.22
+   - T中位数：848
+   - fps唯一值：[30]
+
+7) 维度关系（设计约束）：
+   - dof.shape[0] == pose_aa.shape[0] == root_rot.shape[0]
+     == root_trans_offset.shape[0] == smpl_joints.shape[0] == T
+   - dof第二维固定29（G1主关节）
+   - pose_aa第二维固定30（body数）
+   - smpl_joints第二维固定24（SMPL 24关节）
+
+
+三、字段语义（结合文档与代码）
+1) root_trans_offset: 根平移轨迹，(T, 3)
+2) pose_aa: 每个body的轴角旋转，(T, num_bodies, 3)
+3) dof: MuJoCo顺序的关节位置，(T, num_dof)
+4) root_rot: 根部四元数，(T, 4)（wxyz）
+5) smpl_joints: SMPL关节坐标，(T, 24, 3)
+6) fps: 原始帧率（当前目录为30）
+
+说明：上述字段定义与文档
+docs/source/user_guide/new_embodiments.md
+中的Step 5: Motion Data一致。
+
+
+四、代码中的数据读取逻辑（核心）
+核心文件：
+gear_sonic/utils/motion_lib/motion_lib_base.py
+
+1) load_data(motion_file)
+   - 若motion_file是单个文件：直接joblib.load到self._motion_data_load
+   - 若motion_file是目录：
+     a) 递归扫描**/*.pkl（排除metadata.pkl）
+     b) 构建字典：motion_key -> {"path": pkl_path}
+     c) 额外查找metadata.pkl（根目录及子目录）
+     d) 将metadata中的字段merge到对应motion_key（只更新已存在key）
+   - 结果：self._motion_data_load保存所有可用motion索引与元信息
+
+2) load_motions(...) -> load_motion_with_skeleton(...)
+   - 多进程分块读取motion
+   - 对每个motion：
+     a) 若条目中有"path"，执行joblib.load(path)
+     b) 取单条motion内容（单键dict的value）
+     c) 读取root_trans_offset与pose_aa，并按max_len裁剪
+     d) 若缺fps则默认30
+     e) 调用mesh_parsers.fk_batch做前向运动学，并按target_fps插值
+   - 可选读取并对齐：
+     - smpl_data（smpl_pose/smpl_joints/smpl_transl）
+     - soma_data
+     - object_data
+   - 最终拼接为训练所需张量（dof_pos, dof_vel, body_pos_w等）
+
+3) 自适应采样中的懒加载（init_adaptive_sampling）
+   - 若metadata中没有length/root_trans_offset，则通过path再次joblib.load
+   - 用root_trans_offset.shape[0]推导原始帧数
+   - 结合source fps与target_fps计算重采样后的num_frames
+
+
+五、与当前数据集（robot_filtered/210531）的对应结论
+1) 该目录下PKL均为“单动作单文件”格式（单键dict）
+2) 训练读取时是“目录索引 + 按需懒加载单文件”的模式
+3) 该目录字段完整，能满足核心读取路径（root_trans_offset + pose_aa + fps）
+4) smpl_joints字段已存在且维度统一，有利于SMPL相关训练分支
+
+motion 所用的字段：
+        return_dict.update(
+            {
+                "root_pos": body_pos_w[..., 0, :].clone(),
+                "root_rot": body_quat_w[..., 0, :].clone(),
+                "dof_pos": dof_pos.clone(),
+                "root_vel": body_lin_vel_w[..., 0, :].clone(),
+                "root_ang_vel": body_ang_vel_w[..., 0, :].clone(),
+                "dof_vel": dof_vel.clone(),
+                "motion_aa": self._motion_aa[f0l].clone(),
+                "motion_bodies": self._motion_bodies[motion_ids].clone(),
+                "body_pos_w": body_pos_w.clone(),
+                "body_quat_w": body_quat_w.clone(),
+                "body_lin_vel_w": body_lin_vel_w.clone(),
+                "body_ang_vel_w": body_ang_vel_w.clone(),
+                "body_pos_w_t": body_pos_t_w.clone(),
+                "body_quat_t": body_quat_t_w.clone(),
+                "body_lin_vel_w_t": body_lin_vel_t_w.clone(),
+                "body_ang_vel_t": body_ang_vel_t_w.clone(),
+            }

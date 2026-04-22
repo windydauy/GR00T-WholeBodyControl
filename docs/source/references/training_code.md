@@ -327,6 +327,11 @@ python gear_sonic/eval_agent_trl.py +checkpoint=path/to/model.pt +headless=True 
     ++manager_env.config.render_results=True \
     +manager_env/recorders=render
 ```
+python gear_sonic/eval_agent_trl.py +checkpoint=/home/humanoid/yzh/GR00T-WholeBodyControl/sonic_release/last.pt +headless=True \
+    ++num_envs=16 +run_once=True \
+    ++manager_env.config.save_rendering_dir=path/to/output \
+    ++manager_env.config.render_results=True \
+    +manager_env/recorders=render
 
 Key features:
 - Merges training config with eval overrides (`eval_overrides` in config)

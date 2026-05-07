@@ -121,3 +121,46 @@ def test_g1_only_tokenizer_policy_reward_and_aux_configs():
 
     assert set(aux_cfg.aux_loss_coef.keys()) == {"g1_recon"}
     assert aux_cfg.aux_loss_coef.g1_recon == 0.01
+
+
+def test_global_body_curriculum_preset_exposes_new_anchor_and_ee_schedule_params():
+    cfg = load_yaml(
+        "gear_sonic/config/exp/manager/universal_token/all_modes/sonic_g1_only_5point_ori_lite_adp_global_body_curriculum.yaml"
+    )
+
+    defaults = cfg.defaults
+    assert any(
+        "/exp/manager/universal_token/all_modes/sonic_g1_only_5point_ori_lite_adp_global_body"
+        in str(item)
+        for item in defaults
+    )
+
+    tracking_anchor_pos = cfg.manager_env.rewards.tracking_anchor_pos.params
+    assert tracking_anchor_pos.use_curriculum is True
+    assert tracking_anchor_pos.curriculum_start_step == 10000
+    assert tracking_anchor_pos.curriculum_end_step == 15000
+    assert tracking_anchor_pos.weight_scale_start == 0.0
+    assert tracking_anchor_pos.weight_scale_final == 1.0
+    assert tracking_anchor_pos.sigma_start == 0.60
+    assert tracking_anchor_pos.sigma_final == 0.30
+
+    tracking_anchor_ori = cfg.manager_env.rewards.tracking_anchor_ori.params
+    assert tracking_anchor_ori.use_curriculum is True
+    assert tracking_anchor_ori.sigma_start == 0.80
+    assert tracking_anchor_ori.sigma_final == 0.40
+
+    ee_pos = cfg.manager_env.rewards.adp_tracking_endpoint_local_pos.params
+    assert ee_pos.base_vel_gate_threshold == 0.02
+    assert ee_pos.ee_speed_min == 0.05
+    assert ee_pos.ee_speed_max == 0.10
+    assert ee_pos.sigma_pos_min_start == 0.10
+    assert ee_pos.sigma_pos_min_final == 0.01
+    assert ee_pos.sigma_pos_max == 0.10
+    assert ee_pos.ee_weight_start == 0.1
+    assert ee_pos.ee_weight_final == 0.5
+
+    ee_ori = cfg.manager_env.rewards.adp_tracking_endpoint_local_ori.params
+    assert ee_ori.sigma_rot_min == 5.0
+    assert ee_ori.sigma_rot_max == 20.0
+    assert ee_ori.curriculum_start_step == 10000
+    assert ee_ori.curriculum_end_step == 15000

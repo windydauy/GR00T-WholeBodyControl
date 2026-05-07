@@ -1,0 +1,9 @@
+# Standard critic observations composition with multi-future world-anchor pose
+# and endpoint poses relative to the root frame.
+
+defaults:
+  - privileged_mf_hist
+  - ../terms/motion_anchor_pose_w_mf@_here_
+  - ../terms/endpoint_pose_root_local_mf@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.PrivilegedCfg

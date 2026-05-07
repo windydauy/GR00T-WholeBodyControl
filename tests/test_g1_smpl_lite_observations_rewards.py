@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
 import sys
 import types
@@ -162,6 +163,7 @@ class _FakeEnv:
         self.num_envs = 1
         self.device = torch.device("cpu")
         self.command_manager = _FakeCommandManager(command)
+        self.wrapper = types.SimpleNamespace(current_global_step=0)
 
 
 def _identity_quat(*shape):
@@ -169,7 +171,7 @@ def _identity_quat(*shape):
 
 
 def _make_command():
-    cfg = types.SimpleNamespace(endpoint_body=["lw", "rw", "lf", "rf"])
+    cfg = types.SimpleNamespace(endpoint_body=["lw", "rw", "lf", "rf"], dt_future_ref_frames=0.1)
     command = types.SimpleNamespace()
     command.cfg = cfg
     command.num_future_frames = 2
@@ -192,6 +194,7 @@ def _make_command():
         [[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [4.0, 0.0, 0.0]]]
     )
     command.endpoint_body_quat_w = _identity_quat(1, 4)
+    command.anchor_lin_vel_w = torch.zeros((1, 3), dtype=torch.float32)
     command.robot_anchor_pos_w = torch.tensor([[0.0, 0.0, 0.0]])
     command.robot_anchor_quat_w = _identity_quat(1)
     command.robot_endpoint_body_pos_w = command.endpoint_body_pos_w.clone()
@@ -273,3 +276,223 @@ def test_tracking_endpoint_local_ori_is_one_for_perfect_match_and_drops_with_rot
 
     assert torch.allclose(perfect, torch.ones_like(perfect))
     assert rotated.item() < perfect.item()
+
+
+def test_adaptive_sigma_clamps_and_interpolates(lite_modules):
+    _, rewards = lite_modules
+
+    speed = torch.tensor([0.0, 0.075, 0.2], dtype=torch.float32)
+    sigma = rewards._adaptive_sigma(speed, 0.05, 0.10, 0.01, 0.10)
+
+    expected = torch.tensor([0.01, 0.055, 0.10], dtype=torch.float32)
+    assert torch.allclose(sigma, expected, atol=1e-6)
+
+
+def test_adaptive_endpoint_pos_reward_falls_back_to_legacy_params(lite_modules):
+    _, rewards = lite_modules
+    command = _make_command()
+    env = _FakeEnv(command)
+
+    reward = rewards.adp_tracking_endpoint_local_pos_error(
+        env,
+        "motion",
+        std=0.1,
+        lin_vel_threshold=0.5,
+    )
+
+    assert torch.allclose(reward, torch.ones_like(reward))
+
+
+def test_adaptive_endpoint_gate_zeroes_reward_when_base_reference_moves_fast(lite_modules):
+    _, rewards = lite_modules
+    command = _make_command()
+    command.anchor_lin_vel_w[:] = torch.tensor([[0.03, 0.0, 0.0]])
+    env = _FakeEnv(command)
+
+    reward = rewards.adp_tracking_endpoint_local_pos_error(
+        env,
+        "motion",
+        std=0.1,
+        base_vel_gate_threshold=0.02,
+        ee_speed_min=0.05,
+        ee_speed_max=0.10,
+        sigma_pos_min_start=0.10,
+        sigma_pos_min_final=0.01,
+        sigma_pos_max=0.10,
+        ee_weight_start=0.1,
+        ee_weight_final=0.5,
+        curriculum_start_step=10000,
+        curriculum_end_step=15000,
+    )
+
+    assert torch.allclose(reward, torch.zeros_like(reward))
+
+
+def test_adaptive_endpoint_reward_uses_weight_schedule_when_active(lite_modules):
+    _, rewards = lite_modules
+    command = _make_command()
+    env = _FakeEnv(command)
+
+    env.wrapper.current_global_step = 0
+    reward_start = rewards.adp_tracking_endpoint_local_pos_error(
+        env,
+        "motion",
+        std=0.1,
+        base_vel_gate_threshold=0.02,
+        ee_speed_min=0.05,
+        ee_speed_max=0.10,
+        sigma_pos_min_start=0.10,
+        sigma_pos_min_final=0.01,
+        sigma_pos_max=0.10,
+        ee_weight_start=0.1,
+        ee_weight_final=0.5,
+        curriculum_start_step=10000,
+        curriculum_end_step=15000,
+    )
+    env.wrapper.current_global_step = 12500
+    reward_mid = rewards.adp_tracking_endpoint_local_pos_error(
+        env,
+        "motion",
+        std=0.1,
+        base_vel_gate_threshold=0.02,
+        ee_speed_min=0.05,
+        ee_speed_max=0.10,
+        sigma_pos_min_start=0.10,
+        sigma_pos_min_final=0.01,
+        sigma_pos_max=0.10,
+        ee_weight_start=0.1,
+        ee_weight_final=0.5,
+        curriculum_start_step=10000,
+        curriculum_end_step=15000,
+    )
+    env.wrapper.current_global_step = 20000
+    reward_end = rewards.adp_tracking_endpoint_local_pos_error(
+        env,
+        "motion",
+        std=0.1,
+        base_vel_gate_threshold=0.02,
+        ee_speed_min=0.05,
+        ee_speed_max=0.10,
+        sigma_pos_min_start=0.10,
+        sigma_pos_min_final=0.01,
+        sigma_pos_max=0.10,
+        ee_weight_start=0.1,
+        ee_weight_final=0.5,
+        curriculum_start_step=10000,
+        curriculum_end_step=15000,
+    )
+
+    assert reward_start.item() == pytest.approx(0.1, abs=1e-6)
+    assert reward_mid.item() == pytest.approx(0.3, abs=1e-6)
+    assert reward_end.item() == pytest.approx(0.5, abs=1e-6)
+
+
+def test_adaptive_endpoint_orientation_reward_uses_same_weight_schedule(lite_modules):
+    _, rewards = lite_modules
+    command = _make_command()
+    env = _FakeEnv(command)
+    env.wrapper.current_global_step = 12500
+
+    reward = rewards.adp_tracking_endpoint_local_ori_error(
+        env,
+        "motion",
+        std=0.4,
+        base_vel_gate_threshold=0.02,
+        ee_speed_min=0.05,
+        ee_speed_max=0.10,
+        sigma_rot_min=5.0,
+        sigma_rot_max=20.0,
+        ee_weight_start=0.1,
+        ee_weight_final=0.5,
+        curriculum_start_step=10000,
+        curriculum_end_step=15000,
+    )
+
+    assert reward.item() == pytest.approx(0.3, abs=1e-6)
+
+
+def test_curriculum_helpers_follow_requested_sigma_schedule(lite_modules):
+    _, rewards = lite_modules
+
+    assert rewards._linear_ramp(0, 10000, 15000, 0.10, 0.01) == pytest.approx(0.10)
+    assert rewards._linear_ramp(12500, 10000, 15000, 0.10, 0.01) == pytest.approx(0.055)
+    assert rewards._linear_ramp(20000, 10000, 15000, 0.10, 0.01) == pytest.approx(0.01)
+
+
+def test_tracking_anchor_position_curriculum_applies_weight_and_sigma(lite_modules):
+    _, rewards = lite_modules
+    command = _make_command()
+    command.robot_anchor_pos_w = torch.tensor([[0.30, 0.0, 0.0]])
+    env = _FakeEnv(command)
+    env.wrapper.current_global_step = 12500
+
+    reward = rewards.tracking_anchor_pos_error(
+        env,
+        "motion",
+        std=0.3,
+        use_curriculum=True,
+        curriculum_start_step=10000,
+        curriculum_end_step=15000,
+        weight_scale_start=0.0,
+        weight_scale_final=1.0,
+        sigma_start=0.60,
+        sigma_final=0.30,
+    )
+
+    expected_sigma = 0.45
+    expected_weight = 0.5
+    expected = expected_weight * math.exp(-(0.30**2) / (expected_sigma**2))
+    assert reward.item() == pytest.approx(expected, abs=1e-6)
+
+
+def test_tracking_anchor_orientation_curriculum_applies_weight_and_sigma(lite_modules):
+    _, rewards = lite_modules
+    command = _make_command()
+    angle = 0.2
+    command.robot_anchor_quat_w = torch.tensor(
+        [[math.cos(angle / 2.0), math.sin(angle / 2.0), 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    env = _FakeEnv(command)
+    env.wrapper.current_global_step = 12500
+
+    reward = rewards.tracking_anchor_ori_error(
+        env,
+        "motion",
+        std=0.4,
+        use_curriculum=True,
+        curriculum_start_step=10000,
+        curriculum_end_step=15000,
+        weight_scale_start=0.0,
+        weight_scale_final=1.0,
+        sigma_start=0.80,
+        sigma_final=0.40,
+    )
+
+    expected_sigma = 0.60
+    expected_weight = 0.5
+    expected = expected_weight * math.exp(-(angle**2) / (expected_sigma**2))
+    assert reward.item() == pytest.approx(expected, abs=1e-6)
+
+
+def test_invalid_adaptive_sigma_config_raises(lite_modules):
+    _, rewards = lite_modules
+
+    with pytest.raises(ValueError, match="ee_speed_max must be greater"):
+        rewards._adaptive_sigma(torch.zeros(1), 0.10, 0.10, 0.01, 0.10)
+
+
+def test_invalid_curriculum_window_raises(lite_modules):
+    _, rewards = lite_modules
+    command = _make_command()
+    env = _FakeEnv(command)
+
+    with pytest.raises(ValueError, match="curriculum_end_step must be greater"):
+        rewards.tracking_anchor_pos_error(
+            env,
+            "motion",
+            std=0.3,
+            use_curriculum=True,
+            curriculum_start_step=10000,
+            curriculum_end_step=10000,
+        )

@@ -1,0 +1,47 @@
+# @package _global_
+# Finetune from the SONIC release checkpoint while keeping the lite_adp task setup.
+# We keep the 5-point/orientation task/reward configuration, but make the frozen
+# G1 encoder and G1 kinematic decoder checkpoint-compatible with the release model.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_g1_only_5point_ori_lite_adp
+  - override /manager_env/observations/critic: privileged_mf_hist_anchor_endpoint
+  - _self_
+
+exp_var: g1_only_5point_ori_lite_adp_release_ckpt_finetune
+
+checkpoint: /home/mole/yzh/GR00T-WholeBodyControl/sonic_release/last.pt
+resume: false
+
+algo:
+  config:
+    freeze_noise_std: false
+
+    checkpoint_finetune:
+      enabled: true
+      ignore_shape_mismatch: true
+      load_policy: true
+      load_value: true
+      policy_include_patterns:
+        - std
+        - actor_module.encoders.g1
+        - actor_module.decoders.g1_kin
+      freeze_policy_paths:
+        - std
+        - actor_module.encoders.g1
+        - actor_module.decoders.g1_kin
+
+    actor:
+      backbone:
+        encoders:
+          g1:
+            params:
+              module_config_dict:
+                layer_config:
+                  hidden_dims: [2048, 1024, 512, 512]
+        decoders:
+          g1_kin:
+            params:
+              module_config_dict:
+                layer_config:
+                  hidden_dims: [2048, 1024, 512, 512]

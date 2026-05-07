@@ -1,0 +1,53 @@
+# @package _global_
+# Global-body adaptive preset with EE reward gating/adaptive sigma and
+# base anchor sigma/weight curriculum enabled.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_g1_only_5point_ori_lite_adp_global_body
+  - _self_
+
+exp_var: g1_only_5point_ori_global_body_curriculum
+
+manager_env:
+  rewards:
+    tracking_anchor_pos:
+      params:
+        use_curriculum: true
+        curriculum_start_step: 10000
+        curriculum_end_step: 20000
+        weight_scale_start: 0.5
+        weight_scale_final: 1.0
+        sigma_start: 0.30
+        sigma_final: 0.10
+    tracking_anchor_ori:
+      params:
+        use_curriculum: true
+        curriculum_start_step: 10000
+        curriculum_end_step: 20000
+        weight_scale_start: 0.5
+        weight_scale_final: 1.0
+        sigma_start: 0.40
+        sigma_final: 0.10
+    adp_tracking_endpoint_local_pos:
+      params:
+        base_vel_gate_threshold: 0.02
+        ee_speed_min: 0.05
+        ee_speed_max: 0.10
+        sigma_pos_min_start: 0.10
+        sigma_pos_min_final: 0.01
+        sigma_pos_max: 0.10
+        ee_weight_start: 0.1
+        ee_weight_final: 0.5
+        curriculum_start_step: 10000
+        curriculum_end_step: 20000
+    adp_tracking_endpoint_local_ori:
+      params:
+        base_vel_gate_threshold: 0.02
+        ee_speed_min: 0.05
+        ee_speed_max: 0.10
+        sigma_rot_min: 0.0872
+        sigma_rot_max: 0.3490
+        ee_weight_start: 0.1
+        ee_weight_final: 0.5
+        curriculum_start_step: 10000
+        curriculum_end_step: 20000

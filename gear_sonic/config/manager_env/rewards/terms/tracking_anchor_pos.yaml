@@ -5,3 +5,10 @@ tracking_anchor_pos:
   params:
     command_name: "motion"
     std: 0.3
+    use_curriculum: false
+    curriculum_start_step: 0
+    curriculum_end_step: 1
+    weight_scale_start: 1.0
+    weight_scale_final: 1.0
+    sigma_start: null
+    sigma_final: null

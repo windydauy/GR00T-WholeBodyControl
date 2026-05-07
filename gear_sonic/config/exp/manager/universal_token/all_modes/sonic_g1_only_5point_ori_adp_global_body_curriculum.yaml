@@ -1,0 +1,11 @@
+# @package _global_
+# Non-lite network variant of sonic_g1_only_5point_ori_lite_adp_global_body_curriculum.
+# Keeps the adaptive/global-body/curriculum task settings, but uses the full-size
+# G1 encoder, G1 dynamics decoder, and G1 kinematics decoder from sonic_g1_only_5point_ori.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_g1_only_5point_ori_lite_adp_global_body_curriculum
+  - override /actor_critic: universal_token/g1_only_mlp_v1_5point_ori
+  - _self_
+
+exp_var: g1_only_5point_ori_adp_global_body_curriculum

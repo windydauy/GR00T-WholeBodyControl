@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
@@ -52,14 +53,162 @@ class RewardsCfg:
     tracking_vr_5point_local = None
     tracking_endpoint_local_pos = None
     tracking_endpoint_local_ori = None
+    adp_tracking_endpoint_local_pos = None
+    adp_tracking_endpoint_local_ori = None
     motion_5point_local_pos = None
     feet_acc = None
     is_terminated = None
     upright_penalty = None
 
 
+def _get_training_step(env: ManagerBasedRLEnv) -> int:
+    wrapper = getattr(env, "wrapper", None)
+    if wrapper is not None and hasattr(wrapper, "current_global_step"):
+        return int(wrapper.current_global_step)
+    if hasattr(env, "current_global_step"):
+        return int(env.current_global_step)
+    return 0
+
+
+def _linear_ramp(
+    step: int, start_step: int, end_step: int, start_val: float, end_val: float
+) -> float:
+    if end_step <= start_step:
+        raise ValueError(
+            f"curriculum_end_step must be greater than curriculum_start_step, got "
+            f"{start_step=} and {end_step=}"
+        )
+    if step <= start_step:
+        return float(start_val)
+    if step >= end_step:
+        return float(end_val)
+    alpha = (step - start_step) / (end_step - start_step)
+    return float((1.0 - alpha) * start_val + alpha * end_val)
+
+
+def _adaptive_sigma(
+    speed: torch.Tensor,
+    speed_min: float,
+    speed_max: float,
+    sigma_min: float | torch.Tensor,
+    sigma_max: float,
+) -> torch.Tensor:
+    if speed_max <= speed_min:
+        raise ValueError(
+            f"ee_speed_max must be greater than ee_speed_min, got "
+            f"{speed_min=} and {speed_max=}"
+        )
+
+    sigma_min_t = torch.as_tensor(sigma_min, dtype=speed.dtype, device=speed.device)
+    sigma_max_t = torch.as_tensor(sigma_max, dtype=speed.dtype, device=speed.device)
+    if torch.any(sigma_min_t > sigma_max_t):
+        raise ValueError(
+            f"sigma_max must be >= sigma_min for adaptive interpolation, got "
+            f"{sigma_min_t=} and {sigma_max_t=}"
+        )
+
+    alpha = (speed - speed_min) / (speed_max - speed_min)
+    sigma = alpha * (sigma_max_t - sigma_min_t) + sigma_min_t
+    return torch.minimum(torch.maximum(sigma, sigma_min_t), sigma_max_t)
+
+
+def _reference_endpoint_speed(command: TrackingCommand) -> torch.Tensor:
+    dt = getattr(command.cfg, "dt_future_ref_frames", None)
+    if dt is None or dt <= 0:
+        raise ValueError(
+            f"Tracking command must define a positive dt_future_ref_frames, got {dt}"
+        )
+
+    current_pos = command.endpoint_body_pos_w
+    future_pos = command.endpoint_body_pos_w_multi_future
+    if future_pos.ndim != 4:
+        raise ValueError(
+            f"Expected endpoint_body_pos_w_multi_future to have shape [E, F, B, 3], "
+            f"got {tuple(future_pos.shape)}"
+        )
+
+    first_future = future_pos[:, 0]
+    return torch.linalg.norm(first_future - current_pos, dim=-1) / dt
+
+
+def _scheduled_curriculum_value(
+    env: ManagerBasedRLEnv,
+    enabled: bool,
+    start_step: int,
+    end_step: int,
+    start_val: float,
+    end_val: float,
+) -> float:
+    if not enabled:
+        return float(end_val)
+    return _linear_ramp(_get_training_step(env), start_step, end_step, start_val, end_val)
+
+
+def _compute_endpoint_local_positions(
+    env: ManagerBasedRLEnv, command: TrackingCommand
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_endpoints = len(command.cfg.endpoint_body)
+    ref_root_quat = command.anchor_quat_w.view(env.num_envs, 1, 4).repeat(1, num_endpoints, 1)
+    robot_root_quat = command.robot_anchor_quat_w.view(env.num_envs, 1, 4).repeat(
+        1, num_endpoints, 1
+    )
+
+    ref_local = quat_apply(
+        quat_inv(ref_root_quat), command.endpoint_body_pos_w - command.anchor_pos_w[:, None, :]
+    )
+    robot_local = quat_apply(
+        quat_inv(robot_root_quat),
+        command.robot_endpoint_body_pos_w - command.robot_anchor_pos_w[:, None, :],
+    )
+    return ref_local, robot_local
+
+
+def _compute_endpoint_local_orientations(
+    env: ManagerBasedRLEnv, command: TrackingCommand
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_endpoints = len(command.cfg.endpoint_body)
+    ref_root_quat = command.anchor_quat_w.view(env.num_envs, 1, 4).repeat(1, num_endpoints, 1)
+    robot_root_quat = command.robot_anchor_quat_w.view(env.num_envs, 1, 4).repeat(
+        1, num_endpoints, 1
+    )
+    ref_local = quat_mul(quat_inv(ref_root_quat), command.endpoint_body_quat_w)
+    robot_local = quat_mul(quat_inv(robot_root_quat), command.robot_endpoint_body_quat_w)
+    return ref_local, robot_local
+
+
+def _legacy_adaptive_endpoint_local_pos_reward(
+    env: ManagerBasedRLEnv, command: TrackingCommand, std: float, lin_vel_threshold: float
+) -> torch.Tensor:
+    lin_vel_mag = torch.norm(command.anchor_lin_vel_w, dim=-1)
+    active = lin_vel_mag < lin_vel_threshold
+    ref_local, robot_local = _compute_endpoint_local_positions(env, command)
+    error = torch.sum(torch.square(robot_local - ref_local), dim=-1)
+    reward = torch.exp(-error.mean(dim=-1) / (std * std))
+    return reward * active.float()
+
+
+def _legacy_adaptive_endpoint_local_ori_reward(
+    env: ManagerBasedRLEnv, command: TrackingCommand, std: float, lin_vel_threshold: float
+) -> torch.Tensor:
+    lin_vel_mag = torch.norm(command.anchor_lin_vel_w, dim=-1)
+    active = lin_vel_mag < lin_vel_threshold
+    ref_local, robot_local = _compute_endpoint_local_orientations(env, command)
+    error = quat_error_magnitude(ref_local, robot_local).square()
+    reward = torch.exp(-error.mean(dim=-1) / (std * std))
+    return reward * active.float()
+
+
 def tracking_anchor_pos_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    use_curriculum: bool = False,
+    curriculum_start_step: int = 0,
+    curriculum_end_step: int = 1,
+    weight_scale_start: float = 1.0,
+    weight_scale_final: float = 1.0,
+    sigma_start: float | None = None,
+    sigma_final: float | None = None,
 ) -> torch.Tensor:
     """Compute anchor position tracking reward using a Gaussian kernel.
 
@@ -75,13 +224,41 @@ def tracking_anchor_pos_error(
         Reward tensor of shape (num_envs,) in [0, 1].
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
+    scheduled_weight = _scheduled_curriculum_value(
+        env,
+        use_curriculum,
+        curriculum_start_step,
+        curriculum_end_step,
+        weight_scale_start,
+        weight_scale_final,
+    )
+    scheduled_sigma = std
+    if use_curriculum and sigma_start is not None and sigma_final is not None:
+        scheduled_sigma = _scheduled_curriculum_value(
+            env,
+            True,
+            curriculum_start_step,
+            curriculum_end_step,
+            sigma_start,
+            sigma_final,
+        )
     diff = command.anchor_pos_w - command.robot_anchor_pos_w
     sq_dist = (diff * diff).sum(dim=-1)
-    return torch.exp(-sq_dist / (std * std))
+    reward = torch.exp(-sq_dist / (scheduled_sigma * scheduled_sigma))
+    return reward * scheduled_weight
 
 
 def tracking_anchor_ori_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    use_curriculum: bool = False,
+    curriculum_start_step: int = 0,
+    curriculum_end_step: int = 1,
+    weight_scale_start: float = 1.0,
+    weight_scale_final: float = 1.0,
+    sigma_start: float | None = None,
+    sigma_final: float | None = None,
 ) -> torch.Tensor:
     """Compute anchor orientation tracking reward using a Gaussian kernel.
 
@@ -96,8 +273,27 @@ def tracking_anchor_ori_error(
         Reward tensor of shape (num_envs,) in [0, 1].
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
+    scheduled_weight = _scheduled_curriculum_value(
+        env,
+        use_curriculum,
+        curriculum_start_step,
+        curriculum_end_step,
+        weight_scale_start,
+        weight_scale_final,
+    )
+    scheduled_sigma = std
+    if use_curriculum and sigma_start is not None and sigma_final is not None:
+        scheduled_sigma = _scheduled_curriculum_value(
+            env,
+            True,
+            curriculum_start_step,
+            curriculum_end_step,
+            sigma_start,
+            sigma_final,
+        )
     angular_err = quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w)
-    return torch.exp(-angular_err.square() / (std * std))
+    reward = torch.exp(-angular_err.square() / (scheduled_sigma * scheduled_sigma))
+    return reward * scheduled_weight
 
 
 def upright_penalty(
@@ -406,6 +602,167 @@ def tracking_endpoint_local_ori_error(
     robot_local = quat_mul(quat_inv(robot_root_quat), command.robot_endpoint_body_quat_w)
     error = quat_error_magnitude(ref_local, robot_local).square()
     return torch.exp(-error.mean(dim=-1) / (std * std))
+
+
+def adp_tracking_endpoint_local_pos_error(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    lin_vel_threshold: float = 0.5,
+    base_vel_gate_threshold: float | None = None,
+    ee_speed_min: float | None = None,
+    ee_speed_max: float | None = None,
+    sigma_pos_min_start: float | None = None,
+    sigma_pos_min_final: float | None = None,
+    sigma_pos_max: float | None = None,
+    ee_weight_start: float | None = None,
+    ee_weight_final: float | None = None,
+    curriculum_start_step: int | None = None,
+    curriculum_end_step: int | None = None,
+) -> torch.Tensor:
+    """Adaptive endpoint position tracking reward based on anchor linear velocity.
+
+    Only activates when the reference anchor's linear velocity magnitude is below
+    the specified threshold. This is useful for focusing on precise endpoint tracking
+    during slow or stationary motions (e.g., reaching, manipulation).
+
+    Args:
+        env: The environment.
+        command_name: Name of the tracking command term.
+        std: Standard deviation for the Gaussian kernel.
+        lin_vel_threshold: Threshold for anchor linear velocity magnitude (m/s).
+            Reward is only active when |anchor_lin_vel| < threshold.
+
+    Returns:
+        Reward tensor of shape (num_envs,) in [0, 1].
+    """
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    new_params = (
+        base_vel_gate_threshold,
+        ee_speed_min,
+        ee_speed_max,
+        sigma_pos_min_start,
+        sigma_pos_min_final,
+        sigma_pos_max,
+        ee_weight_start,
+        ee_weight_final,
+        curriculum_start_step,
+        curriculum_end_step,
+    )
+    if any(param is None for param in new_params):
+        return _legacy_adaptive_endpoint_local_pos_reward(
+            env,
+            command,
+            std=std,
+            lin_vel_threshold=lin_vel_threshold,
+        )
+
+    base_speed = torch.linalg.norm(command.anchor_lin_vel_w, dim=-1)
+    gate_base = (base_speed < base_vel_gate_threshold).to(dtype=command.anchor_pos_w.dtype)
+
+    weight = _linear_ramp(
+        _get_training_step(env),
+        curriculum_start_step,
+        curriculum_end_step,
+        ee_weight_start,
+        ee_weight_final,
+    )
+    sigma_pos_min = _linear_ramp(
+        _get_training_step(env),
+        curriculum_start_step,
+        curriculum_end_step,
+        sigma_pos_min_start,
+        sigma_pos_min_final,
+    )
+    ee_ref_speed = _reference_endpoint_speed(command)
+    sigma_pos = _adaptive_sigma(
+        ee_ref_speed,
+        ee_speed_min,
+        ee_speed_max,
+        sigma_pos_min,
+        sigma_pos_max,
+    )
+
+    ref_local, robot_local = _compute_endpoint_local_positions(env, command)
+    err_pos = torch.linalg.norm(robot_local - ref_local, dim=-1)
+    reward_pos = torch.exp(-(err_pos.square()) / sigma_pos.square())
+    return gate_base * weight * reward_pos.mean(dim=-1)
+
+
+def adp_tracking_endpoint_local_ori_error(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    lin_vel_threshold: float = 0.5,
+    base_vel_gate_threshold: float | None = None,
+    ee_speed_min: float | None = None,
+    ee_speed_max: float | None = None,
+    sigma_rot_min: float | None = None,
+    sigma_rot_max: float | None = None,
+    ee_weight_start: float | None = None,
+    ee_weight_final: float | None = None,
+    curriculum_start_step: int | None = None,
+    curriculum_end_step: int | None = None,
+) -> torch.Tensor:
+    """Adaptive endpoint orientation tracking reward based on anchor linear velocity.
+
+    Only activates when the reference anchor's linear velocity magnitude is below
+    the specified threshold. This is useful for focusing on precise endpoint orientation
+    tracking during slow or stationary motions.
+
+    Args:
+        env: The environment.
+        command_name: Name of the tracking command term.
+        std: Standard deviation for the Gaussian kernel.
+        lin_vel_threshold: Threshold for anchor linear velocity magnitude (m/s).
+            Reward is only active when |anchor_lin_vel| < threshold.
+
+    Returns:
+        Reward tensor of shape (num_envs,) in [0, 1].
+    """
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    new_params = (
+        base_vel_gate_threshold,
+        ee_speed_min,
+        ee_speed_max,
+        sigma_rot_min,
+        sigma_rot_max,
+        ee_weight_start,
+        ee_weight_final,
+        curriculum_start_step,
+        curriculum_end_step,
+    )
+    if any(param is None for param in new_params):
+        return _legacy_adaptive_endpoint_local_ori_reward(
+            env,
+            command,
+            std=std,
+            lin_vel_threshold=lin_vel_threshold,
+        )
+
+    base_speed = torch.linalg.norm(command.anchor_lin_vel_w, dim=-1)
+    gate_base = (base_speed < base_vel_gate_threshold).to(dtype=command.anchor_pos_w.dtype)
+
+    weight = _linear_ramp(
+        _get_training_step(env),
+        curriculum_start_step,
+        curriculum_end_step,
+        ee_weight_start,
+        ee_weight_final,
+    )
+    ee_ref_speed = _reference_endpoint_speed(command)
+    sigma_rot = _adaptive_sigma(
+        ee_ref_speed,
+        ee_speed_min,
+        ee_speed_max,
+        math.radians(sigma_rot_min),
+        math.radians(sigma_rot_max),
+    )
+
+    ref_local, robot_local = _compute_endpoint_local_orientations(env, command)
+    err_rot = quat_error_magnitude(ref_local, robot_local)
+    reward_rot = torch.exp(-(err_rot.square()) / sigma_rot.square())
+    return gate_base * weight * reward_rot.mean(dim=-1)
 
 
 def tracking_vr_3point_error_pos_force(

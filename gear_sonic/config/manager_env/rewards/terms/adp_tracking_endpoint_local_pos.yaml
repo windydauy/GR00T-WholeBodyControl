@@ -1,0 +1,18 @@
+adp_tracking_endpoint_local_pos:
+  _target_: isaaclab.managers.RewardTermCfg
+  func: gear_sonic.envs.manager_env.mdp:adp_tracking_endpoint_local_pos_error
+  weight: 1.0
+  params:
+    command_name: "motion"
+    std: 0.1
+    lin_vel_threshold: 0.5
+    base_vel_gate_threshold: null
+    ee_speed_min: null
+    ee_speed_max: null
+    sigma_pos_min_start: null
+    sigma_pos_min_final: null
+    sigma_pos_max: null
+    ee_weight_start: null
+    ee_weight_final: null
+    curriculum_start_step: null
+    curriculum_end_step: null

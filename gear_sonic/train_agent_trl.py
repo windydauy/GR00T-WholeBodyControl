@@ -94,6 +94,197 @@ def resume_checkpoint(config):
     config.checkpoint = config.checkpoint
 
 
+def _matches_name_or_prefix(name: str, patterns) -> bool:
+    if patterns is None:
+        return True
+    if len(patterns) == 0:
+        return True
+    return any(name == pattern or name.startswith(f"{pattern}.") for pattern in patterns)
+
+
+def _resolve_attr_path(root_obj, attr_path: str):
+    current = root_obj
+    for part in attr_path.split("."):
+        current = getattr(current, part)
+    return current
+
+
+def _summarize_state_dict_keys(keys: list[str], max_items: int = 8) -> str:
+    if not keys:
+        return "[]"
+    preview = ", ".join(keys[:max_items])
+    if len(keys) > max_items:
+        preview += f", ... (+{len(keys) - max_items} more)"
+    return f"[{preview}]"
+
+
+def _select_state_dict_keys(
+    source_state_dict,
+    target_state_dict,
+    include_patterns=None,
+    exclude_patterns=None,
+    ignore_shape_mismatch: bool = True,
+):
+    filtered_state_dict = {}
+    skipped_missing = []
+    skipped_shape = []
+    skipped_excluded = []
+    skipped_not_included = []
+
+    for key, value in source_state_dict.items():
+        if not _matches_name_or_prefix(key, include_patterns):
+            skipped_not_included.append(key)
+            continue
+        if exclude_patterns is not None and _matches_name_or_prefix(key, exclude_patterns):
+            skipped_excluded.append(key)
+            continue
+        if key not in target_state_dict:
+            skipped_missing.append(key)
+            continue
+        if ignore_shape_mismatch and target_state_dict[key].shape != value.shape:
+            skipped_shape.append(
+                f"{key}: ckpt{tuple(value.shape)} != model{tuple(target_state_dict[key].shape)}"
+            )
+            continue
+        filtered_state_dict[key] = value
+
+    return {
+        "state_dict": filtered_state_dict,
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+        "skipped_excluded": skipped_excluded,
+        "skipped_not_included": skipped_not_included,
+    }
+
+
+def _resolve_checkpoint_state_dict(checkpoint, candidate_keys, label: str):
+    for key in candidate_keys:
+        if key in checkpoint:
+            return key, checkpoint[key]
+    raise KeyError(
+        f"Could not find {label} in checkpoint. Tried keys: {candidate_keys}. "
+        f"Available keys: {sorted(checkpoint.keys())}"
+    )
+
+
+def _load_partial_module_state(
+    module,
+    source_state_dict,
+    include_patterns=None,
+    exclude_patterns=None,
+    ignore_shape_mismatch: bool = True,
+    label: str = "module",
+):
+    selection = _select_state_dict_keys(
+        source_state_dict=source_state_dict,
+        target_state_dict=module.state_dict(),
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        ignore_shape_mismatch=ignore_shape_mismatch,
+    )
+
+    filtered_state_dict = selection["state_dict"]
+    if not filtered_state_dict:
+        logger.warning(
+            f"No checkpoint tensors selected for {label}. "
+            f"include_patterns={include_patterns}, exclude_patterns={exclude_patterns}"
+        )
+        return selection
+
+    missing, unexpected = module.load_state_dict(filtered_state_dict, strict=False)
+    logger.info(
+        f"Loaded {len(filtered_state_dict)} tensors into {label}. "
+        f"missing_after_load={len(missing)}, unexpected_after_load={len(unexpected)}"
+    )
+    if selection["skipped_shape"]:
+        logger.info(
+            f"{label}: skipped shape-mismatched tensors "
+            f"{_summarize_state_dict_keys(selection['skipped_shape'])}"
+        )
+    if selection["skipped_missing"]:
+        logger.info(
+            f"{label}: skipped checkpoint-only tensors "
+            f"{_summarize_state_dict_keys(selection['skipped_missing'])}"
+        )
+    return selection
+
+
+def load_checkpoint_for_finetune(policy, value_model, checkpoint_path, device, finetune_cfg):
+    import gear_sonic.trl.trainer.ppo_trainer as _trl_checkpoint_shim  # noqa: F401
+    import torch
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    ignore_shape_mismatch = finetune_cfg.get("ignore_shape_mismatch", True)
+
+    if finetune_cfg.get("load_policy", True):
+        policy_key, policy_state_dict = _resolve_checkpoint_state_dict(
+            checkpoint,
+            finetune_cfg.get(
+                "policy_state_dict_keys",
+                ["actor_model_state_dict", "policy_state_dict"],
+            ),
+            label="policy state dict",
+        )
+        logger.info(f"Using checkpoint key '{policy_key}' for finetune policy loading")
+        _load_partial_module_state(
+            module=policy,
+            source_state_dict=policy_state_dict,
+            include_patterns=finetune_cfg.get("policy_include_patterns", None),
+            exclude_patterns=finetune_cfg.get("policy_exclude_patterns", None),
+            ignore_shape_mismatch=ignore_shape_mismatch,
+            label="policy",
+        )
+
+    if finetune_cfg.get("load_value", False) and value_model is not None:
+        value_key, value_state_dict = _resolve_checkpoint_state_dict(
+            checkpoint,
+            finetune_cfg.get(
+                "value_state_dict_keys",
+                ["value_state_dict", "critic_model_state_dict"],
+            ),
+            label="value state dict",
+        )
+        logger.info(f"Using checkpoint key '{value_key}' for finetune value loading")
+        _load_partial_module_state(
+            module=value_model,
+            source_state_dict=value_state_dict,
+            include_patterns=finetune_cfg.get("value_include_patterns", None),
+            exclude_patterns=finetune_cfg.get("value_exclude_patterns", None),
+            ignore_shape_mismatch=ignore_shape_mismatch,
+            label="value_model",
+        )
+
+    return checkpoint
+
+
+def freeze_model_paths(module, attr_paths, label: str):
+    if not attr_paths:
+        return
+
+    for attr_path in attr_paths:
+        target = _resolve_attr_path(module, attr_path)
+        if hasattr(target, "parameters"):
+            num_params = 0
+            for param in target.parameters():
+                param.requires_grad = False
+                num_params += param.numel()
+        elif hasattr(target, "requires_grad"):
+            target.requires_grad = False
+            num_params = target.numel()
+        else:
+            raise TypeError(
+                f"Cannot freeze '{attr_path}' under {label}; object has neither parameters() "
+                f"nor requires_grad"
+            )
+        logger.info(f"Froze {label}.{attr_path} ({num_params} parameters)")
+
+
+def log_trainable_parameters(module, label: str):
+    trainable_params = sum(param.numel() for param in module.parameters() if param.requires_grad)
+    total_params = sum(param.numel() for param in module.parameters())
+    logger.info(f"{label}: trainable parameters {trainable_params}/{total_params}")
+
+
 def create_manager_env(config, device, args_cli):
 
     # import wandb
@@ -420,6 +611,32 @@ def main(config: OmegaConf):
 
     materialize_lazy_params(policy, env)
 
+    trainer_checkpoint = config.checkpoint
+    trainer_resume = config.get("resume", False)
+    finetune_cfg = config.algo.config.get("checkpoint_finetune", None)
+    if finetune_cfg is not None and finetune_cfg.get("enabled", False):
+        if config.checkpoint is None:
+            raise ValueError("checkpoint must be set when algo.config.checkpoint_finetune.enabled")
+        load_checkpoint_for_finetune(
+            policy=policy,
+            value_model=value_model,
+            checkpoint_path=config.checkpoint,
+            device=device,
+            finetune_cfg=finetune_cfg,
+        )
+        freeze_model_paths(policy, finetune_cfg.get("freeze_policy_paths", []), label="policy")
+        if value_model is not None:
+            freeze_model_paths(
+                value_model,
+                finetune_cfg.get("freeze_value_paths", []),
+                label="value_model",
+            )
+        log_trainable_parameters(policy, label="policy")
+        if value_model is not None:
+            log_trainable_parameters(value_model, label="value_model")
+        trainer_checkpoint = None
+        trainer_resume = False
+
     if config.algo.config.get("pretrained_model", None) is not None:
         pretrained_cfg = config.algo.config.pretrained_model
         sd_key = pretrained_cfg.get("state_dict_key", "state_dict")
@@ -461,8 +678,8 @@ def main(config: OmegaConf):
         train_dataset=None,
         eval_dataset=None,
         callbacks=callbacks,
-        checkpoint=config.checkpoint,
-        resume=config.get("resume", False),
+        checkpoint=trainer_checkpoint,
+        resume=trainer_resume,
         local_seed=config.seed,
         log_dir=experiment_save_dir,
         accelerator=accelerator,

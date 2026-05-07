@@ -1698,6 +1698,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             batch_start_time = time.time()
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)  # noqa: F841
+            self.env.current_global_step = self.state.global_step
 
             # update scheduled params
             if self.schedule_dict is not None:

@@ -297,6 +297,8 @@ class PrivilegedCfg(ObsGroup):
     motion_anchor_ori_b = None
     motion_anchor_ori_b_mf = None
     motion_anchor_ori_heading_mf = None
+    motion_anchor_pose_w_mf = None
+    endpoint_pose_root_local_mf = None
     body_pos = None
     body_ori = None
     base_lin_vel = None

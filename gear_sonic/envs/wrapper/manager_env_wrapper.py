@@ -32,6 +32,7 @@ class ManagerEnvWrapper:
         self.device = env.device
         self.viewer_focused = True
         self.is_manager_env = True
+        self.current_global_step = 0
         if hasattr(self.env, "num_envs"):
             self.num_envs = self.env.num_envs
         else:

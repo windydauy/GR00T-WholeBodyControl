@@ -17,5 +17,5 @@ g1_dyn:
     module_config_dict:
       layer_config:
         type: MLP
-        hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
+        hidden_dims: [2048, 1024, 1024, 512, 512]
         activation: SiLU

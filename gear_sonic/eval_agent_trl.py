@@ -462,6 +462,7 @@ def main(override_config: omegaconf.OmegaConf):
         logger.info("Successfully loaded policy state dict")
 
     state.global_step = checkpoint["state"].global_step
+    env.current_global_step = state.global_step
 
     schedule_wrapper = easydict.EasyDict(env=env, model=model)
     if "schedule_dict" in config.trainer:

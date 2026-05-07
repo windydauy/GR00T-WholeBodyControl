@@ -1,0 +1,63 @@
+# @package _global_
+# Same as sonic_g1_only_5point_ori_lite_adp, except body position/orientation
+# tracking uses global-frame rewards instead of anchor-relative rewards.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_g1_only_5point_ori_lite_adp
+  - override /manager_env/rewards: tracking/base_5point_global_adp_endpoint_ori_feet_acc
+  - _self_
+
+exp_var: g1_only_5point_ori_global_body
+
+manager_env:
+  rewards:
+    # Tracking rewards - position and orientation
+    tracking_relative_body_pos: null
+    tracking_relative_body_ori: null
+    tracking_anchor_pos:
+      weight: 1.0
+      params:
+        std: 0.3
+    tracking_anchor_ori:
+      weight: 1.0
+      params:
+        std: 0.4
+    tracking_body_pos:
+      weight: 1.0
+      params:
+        std: 0.3
+    tracking_body_ori:
+      weight: 1.0
+      params:
+        std: 0.4
+
+    # Body velocity tracking
+    tracking_body_linvel:
+      weight: 0.5
+      params:
+        std: 1.0
+    tracking_body_angvel:
+      weight: 0.5
+      params:
+        std: 3.14
+    adp_tracking_endpoint_local_ori:
+      weight: 1.0
+      params:
+        lin_vel_threshold: 0.05
+    adp_tracking_endpoint_local_pos:
+      weight: 1.0
+      params:
+        lin_vel_threshold: 0.05
+    # Regularization rewards
+    action_rate_l2:
+      weight: -0.1
+    joint_limit:
+      weight: -10.0
+    undesired_contacts:
+      weight: -0.1
+    anti_shake_ang_vel:
+      weight: -0.005
+
+    # Acceleration penalty
+    feet_acc:
+      weight: -2.5e-6
